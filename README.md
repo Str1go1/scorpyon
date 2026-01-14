@@ -1,4 +1,4 @@
-# Scorpyon 🦂
+# Scorpyon
 
 **Scorpyon** is a network security testing framework written in Python. It provides ARP spoofing, DNS poisoning, and SSL stripping capabilities for man-in-the-middle attacks.
 
