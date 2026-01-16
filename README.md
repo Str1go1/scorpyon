@@ -5,11 +5,7 @@
 ## Features
 
 
-**ARP Spoofing** Layer 2 MITM attack to intercept traffic between target and gateway
-**DNS Poisoning** Redirect DNS queries to attacker-controlled IP via NetfilterQueue
-**SSL Stripping (Proxy)** Downgrade HTTPS to HTTP and proxy real site content
-**SSL Stripping (Phishing)** Serve custom phishing pages over HTTPS
-**Network Scanner** Discover active hosts with MAC addresses and vendor info
+Scorpyon features ARP Spoofing to intercept traffic between the vicitm and the gateway, DNS Poisoning to redirect DNS querries to an attacker controlled ip via netfilterqueue, SSL Stripping to downgrade HTTPS to HTTP and proxy real site content, SSL Spoofing to serve custom phishing pages over HTTPS under the target domain name and a basic network scanner to  qucikly discover active hosts with MAC addresses and vendor info.
 
 ## Requirements
 
@@ -53,7 +49,7 @@ sudo python3 Scorpyon.py
 2. Start DNS poisoning → enter domain and redirect IP
 3. Traffic from target will be intercepted and DNS queries spoofed
 
-### SSL Stripping (Proxy Mode)
+### SSL Stripping
 1. Start ARP spoofing → enter target IP
 2. Start SSL stripping (option 3 when DNS is not running)
 3. Enter target domain (e.g., `example.com`)
